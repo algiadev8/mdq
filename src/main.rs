@@ -72,7 +72,8 @@ enum Command {
         /// Build only this target instead of both.
         #[arg(long, value_enum)]
         only: Option<BuildTarget>,
-        #[arg(long, default_value_t = 64)]
+        /// Maximum documents per embedding batch; smaller CPU batches avoid large attention buffers.
+        #[arg(long, default_value_t = semantic::DEFAULT_BATCH_SIZE)]
         batch_size: usize,
     },
     /// Retrieve source context for a query (default: hybrid BM25 + semantic).
@@ -572,7 +573,7 @@ fn ensure_embeddings_fresh(database: &mut Database, vault: &Path, threshold: usi
     }
     if database.has_embeddings()? && missing <= threshold {
         eprintln!("{missing} chunk(s) missing embeddings; embedding automatically");
-        semantic::embed_missing(database, 64)?;
+        semantic::embed_missing(database, semantic::DEFAULT_BATCH_SIZE)?;
         Ok(())
     } else {
         bail!(

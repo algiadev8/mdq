@@ -22,6 +22,8 @@ frontmatter schema.
 
 ## Build
 
+Requires Rust 1.88 or newer (ONNX Runtime dependency).
+
 ```sh
 cargo build --release
 ```
@@ -91,6 +93,72 @@ already has an index and only a small number of files or chunks have drifted
 automatically and proceeds. A vault that has never been indexed, or that has
 drifted past the threshold, requires an explicit `mdq index` run instead of
 refreshing silently.
+
+Index updates are incremental: every Markdown file is read and SHA-256 checked,
+while unchanged notes reuse their parsed chunks and full-text index entries.
+Only changed/new notes are parsed and tokenized; removed notes are deleted.
+Content-only edits preserve incoming links, while added/removed paths trigger
+full link re-resolution (including ambiguity checks). Updates are atomic and
+retain the embedding cache. Older index formats or a different vault trigger a
+full rebuild automatically. The search-time freshness check still uses file
+mtime and size; run `mdq index --only bm25` explicitly to detect same-size edits
+that preserve the timestamp.
+
+A network-free performance benchmark (initial build, unchanged vault, one edit)
+is available with `cargo test --release --test index_performance -- --ignored --nocapture`.
+
+## Embedding performance
+
+Pending embeddings are grouped by effective tokenizer length before inference,
+reducing padding work without changing the model, passage/query prefixes,
+512-token context limit, pooling, or content-hash cache keys. The CPU default is
+8 documents per batch; use `index --batch-size N` to tune other hardware.
+Automatic embedding refreshes use the same default. Completed batches are saved
+immediately, so interrupted indexing resumes from the embedding cache.
+
+On Apple Silicon macOS, the default `MDQ_EMBED_BACKEND=auto` tries **CoreML**
+(MLProgram, with GPU/Neural Engine selection managed by Apple). It specializes
+fixed batch/token shapes to avoid the dynamic-dimension fallback of the original
+ONNX model. Other platforms keep the CPU path. Initialization or inference
+failure retries the same batch on CPU and disables CoreML for that operation.
+Each new shape is checked against CPU embeddings before its results are cached.
+The compiled CoreML cache is separated by model SHA-256, runtime/settings, and
+shape. First use compiles device-specific models and can take tens of seconds
+per shape; even cached session startup can make small one-off jobs slower than
+CPU. This path is primarily useful for sustained indexing, not a promise that
+every invocation is faster.
+
+Use `MDQ_EMBED_BACKEND=cpu` to force the original CPU path, or
+`MDQ_EMBED_BACKEND=coreml` for strict diagnostics (errors instead of silent CPU
+fallback). `MDQ_COREML_PROFILE=target/coreml-profile` enables ORT execution
+profiles recording which provider actually ran the graph.
+
+To compare the original 64-document batching with the selected backend and
+test the complete embedding pipeline against reference vectors, run:
+
+```sh
+cargo test --release --test embedding_performance -- --ignored --nocapture --test-threads=1
+```
+
+This manual benchmark requires the multilingual-e5-small model in the local
+cache (otherwise fastembed downloads it). `MDQ_BENCH_THREADS` changes the inference
+microbenchmark's thread count; the application retains 4 CPU threads. To isolate
+the CPU path, prefix the command with `MDQ_EMBED_BACKEND=cpu`.
+
+The Apple-only manual test below checks queries, partial batches, truncation,
+CPU compatibility, and **steady-state inference** separately from compilation
+and model/session startup:
+
+```sh
+cargo test --release --lib coreml_real_model_queries_tails_truncation_and_warm_throughput -- --ignored --nocapture
+```
+
+On an M3, 40 full-length (512-token) inputs took 4.231 s on CPU versus 0.873 s
+through CoreML after warm-up (4.85x). These are synthetic measurements, not an
+end-to-end promise: a 64-input mixed-length indexing run took about 139 s on
+first compilation and 32 s with compiled artifacts cached, so short runs can
+still favor CPU. CoreML compilation/session startup is excluded from the 4.85x
+number. Compiled per-shape artifacts also require additional cache disk space.
 
 ## Output
 

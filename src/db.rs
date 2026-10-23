@@ -9,7 +9,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::markdown::{normalize_target, parse_note};
+use crate::markdown::{normalize_target, parse_note_bytes};
 use crate::model::{EmbeddingInput, LinkRef, NoteRef, NoteResolution, PageRecord, SearchHit};
 use crate::query::MetadataFilter;
 use crate::tokenize::{fts_query, index_text};
@@ -121,6 +121,7 @@ impl Database {
                 search_text TEXT NOT NULL DEFAULT '',
                 content_hash TEXT NOT NULL DEFAULT ''
             );
+            CREATE INDEX IF NOT EXISTS chunks_note_idx ON chunks(note_id);
             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                 search_text,
                 content='chunks',
@@ -273,18 +274,18 @@ impl Database {
 
     pub fn store_embeddings(&mut self, model: &str, items: &[(String, Vec<f32>)]) -> Result<()> {
         let transaction = self.connection.transaction()?;
-        for (content_hash, vector) in items {
-            let blob = vector_to_blob(vector);
-            transaction.execute(
-                "
-                INSERT INTO embeddings(content_hash, model, dimensions, vector)
-                VALUES (?1, ?2, ?3, ?4)
-                ON CONFLICT(content_hash, model) DO UPDATE SET
-                    dimensions = excluded.dimensions,
-                    vector = excluded.vector
-                ",
-                params![content_hash, model, vector.len() as i64, blob],
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO embeddings(content_hash, model, dimensions, vector)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(content_hash, model) DO UPDATE SET
+                     dimensions = excluded.dimensions,
+                     vector = excluded.vector",
             )?;
+            for (content_hash, vector) in items {
+                let blob = vector_to_blob(vector);
+                insert.execute(params![content_hash, model, vector.len() as i64, blob])?;
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -961,14 +962,37 @@ fn rebuild_in_transaction(
     transaction: &rusqlite::Transaction<'_>,
     vault: &Path,
 ) -> Result<IndexStats> {
-    transaction.execute_batch(
-        "
-        DELETE FROM chunks_fts;
-        DELETE FROM links;
-        DELETE FROM chunks;
-        DELETE FROM notes;
-        ",
-    )?;
+    // Bump this whenever parsing/tokenization or the persisted index format changes.
+    // Old indexes and indexes belonging to a different vault must be rebuilt fully.
+    const INDEX_VERSION: &str = "1";
+    let vault_path = canonical(vault)?.to_string_lossy().into_owned();
+    let metadata = |key: &str| -> rusqlite::Result<Option<String>> {
+        transaction
+            .query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+    };
+    let incremental = metadata("index_version")?.as_deref() == Some(INDEX_VERSION)
+        && metadata("vault")?.as_deref() == Some(vault_path.as_str());
+    let mut previous = HashMap::<String, (i64, String)>::new();
+    if incremental {
+        let mut statement = transaction.prepare("SELECT path, id, content_hash FROM notes")?;
+        let rows = statement.query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?;
+        for row in rows {
+            let (path, value) = row?;
+            previous.insert(path, value);
+        }
+    } else {
+        transaction.execute_batch(
+            "INSERT INTO chunks_fts(chunks_fts) VALUES('delete-all');
+             DELETE FROM links;
+             DELETE FROM chunks;
+             DELETE FROM notes;",
+        )?;
+    }
+    // Also create this for databases opened through open_existing() before migration.
+    transaction.execute_batch("CREATE INDEX IF NOT EXISTS chunks_note_idx ON chunks(note_id)")?;
 
     let files: Vec<PathBuf> = WalkDir::new(vault)
         .follow_links(false)
@@ -985,26 +1009,83 @@ fn rebuild_in_transaction(
         .map(DirEntry::into_path)
         .collect();
 
-    let mut chunk_count = 0;
-    let mut link_count = 0;
+    let mut insert_note = transaction.prepare(
+        "INSERT INTO notes(path, title, body, body_start_line, frontmatter_json, mtime, ctime, size, content_hash, id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(id) DO UPDATE SET
+             body = excluded.body, body_start_line = excluded.body_start_line,
+             frontmatter_json = excluded.frontmatter_json, mtime = excluded.mtime,
+             ctime = excluded.ctime, size = excluded.size, content_hash = excluded.content_hash",
+    )?;
+    let mut insert_chunk = transaction.prepare(
+        "INSERT INTO chunks(note_id, ordinal, heading, body, search_text, content_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    )?;
+    let mut insert_fts =
+        transaction.prepare("INSERT INTO chunks_fts(rowid, search_text) VALUES (?1, ?2)")?;
+    let mut insert_link = transaction.prepare(
+        "INSERT INTO links(source_note_id, raw_target, normalized_target, heading, is_embed)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    let mut delete_fts = transaction.prepare(
+        "INSERT INTO chunks_fts(chunks_fts, rowid, search_text)
+         SELECT 'delete', id, search_text FROM chunks WHERE note_id = ?1",
+    )?;
+    let mut delete_note = transaction.prepare("DELETE FROM notes WHERE id = ?1")?;
+    let mut delete_chunks = transaction.prepare("DELETE FROM chunks WHERE note_id = ?1")?;
+    let mut delete_links = transaction.prepare("DELETE FROM links WHERE source_note_id = ?1")?;
+    let mut refresh_times = transaction.prepare(
+        "UPDATE notes SET mtime = ?2, ctime = ?3, size = ?4 WHERE id = ?1
+         AND (mtime != ?2 OR ctime != ?3 OR size != ?4)",
+    )?;
+    let mut changed = !incremental;
+    let mut identities_changed = !incremental;
     for file in &files {
-        let note = parse_note(vault, file)?;
-        transaction.execute(
-            "INSERT INTO notes(path, title, body, body_start_line, frontmatter_json, mtime, ctime, size, content_hash)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                note.path,
-                note.title,
-                note.body,
-                note.body_start_line as i64,
-                note.frontmatter.as_ref().map(serde_json::Value::to_string),
-                note.mtime,
-                note.ctime,
-                note.size as i64,
-                note.hash,
-            ],
-        )?;
-        let note_id = transaction.last_insert_rowid();
+        // Always hash the bytes: mtime/size alone miss same-size edits within one second.
+        let bytes =
+            std::fs::read(file).with_context(|| format!("failed to read {}", file.display()))?;
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let path = file
+            .strip_prefix(vault)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let old = previous.remove(&path);
+        let old_id = old.as_ref().map(|(id, _)| *id);
+        if let Some((id, old_hash)) = old {
+            if old_hash == hash {
+                let metadata = std::fs::metadata(file)?;
+                let seconds = |time: std::io::Result<std::time::SystemTime>| {
+                    time.ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_secs() as i64)
+                };
+                let mtime = seconds(metadata.modified()).unwrap_or_default();
+                let ctime = seconds(metadata.created()).unwrap_or(mtime);
+                refresh_times.execute(params![id, mtime, ctime, metadata.len() as i64])?;
+                continue;
+            }
+            delete_fts.execute([id])?;
+            delete_chunks.execute([id])?;
+            delete_links.execute([id])?;
+        } else {
+            identities_changed = true;
+        }
+        changed = true;
+        let note = parse_note_bytes(vault, file, &bytes, hash)?;
+        insert_note.execute(params![
+            note.path,
+            note.title,
+            note.body,
+            note.body_start_line as i64,
+            note.frontmatter.as_ref().map(serde_json::Value::to_string),
+            note.mtime,
+            note.ctime,
+            note.size as i64,
+            note.hash,
+            old_id,
+        ])?;
+        let note_id = old_id.unwrap_or_else(|| transaction.last_insert_rowid());
         for chunk in note.chunks {
             let searchable = format!(
                 "{} {} {}",
@@ -1014,58 +1095,73 @@ fn rebuild_in_transaction(
             );
             let search_text = index_text(&searchable);
             let content_hash = hex::encode(Sha256::digest(searchable.as_bytes()));
-            transaction.execute(
-                "INSERT INTO chunks(
-                    note_id, ordinal, heading, body, search_text, content_hash
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    note_id,
-                    chunk.ordinal as i64,
-                    chunk.heading,
-                    chunk.body,
-                    search_text,
-                    content_hash,
-                ],
-            )?;
+            insert_chunk.execute(params![
+                note_id,
+                chunk.ordinal as i64,
+                chunk.heading,
+                chunk.body,
+                search_text,
+                content_hash,
+            ])?;
             let chunk_id = transaction.last_insert_rowid();
-            transaction.execute(
-                "INSERT INTO chunks_fts(rowid, search_text) VALUES (?1, ?2)",
-                params![chunk_id, index_text(&searchable)],
-            )?;
-            chunk_count += 1;
+            if incremental {
+                insert_fts.execute(params![chunk_id, search_text])?;
+            }
         }
         for link in note.links {
-            transaction.execute(
-                "INSERT INTO links(
-                    source_note_id, raw_target, normalized_target, heading, is_embed
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    note_id,
-                    link.raw_target,
-                    link.target,
-                    link.heading,
-                    link.is_embed,
-                ],
-            )?;
-            link_count += 1;
+            insert_link.execute(params![
+                note_id,
+                link.raw_target,
+                link.target,
+                link.heading,
+                link.is_embed,
+            ])?;
         }
     }
-
-    resolve_links(transaction)?;
+    for (id, _) in previous.into_values() {
+        delete_fts.execute([id])?;
+        delete_note.execute([id])?;
+        changed = true;
+        identities_changed = true;
+    }
+    if !incremental {
+        // External-content FTS can tokenize all persisted chunks in one bulk operation.
+        transaction.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')", [])?;
+    }
+    if changed {
+        if identities_changed {
+            // Added/removed paths can make even unchanged sources ambiguous. Body-only
+            // edits preserve note IDs, so their existing incoming edges remain valid.
+            transaction.execute(
+                "UPDATE links SET target_note_id = NULL WHERE target_note_id IS NOT NULL",
+                [],
+            )?;
+        }
+        resolve_links(transaction)?;
+    }
     transaction.execute(
         "INSERT INTO metadata(key, value) VALUES ('vault', ?1)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [canonical(vault)?.to_string_lossy().as_ref()],
+        [&vault_path],
     )?;
     transaction.execute(
         "INSERT INTO metadata(key, value) VALUES ('indexed_at', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         [],
     )?;
+    transaction.execute(
+        "INSERT INTO metadata(key, value) VALUES ('index_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [INDEX_VERSION],
+    )?;
     Ok(IndexStats {
         notes: files.len(),
-        chunks: chunk_count,
-        links: link_count,
+        chunks: transaction.query_row("SELECT count(*) FROM chunks", [], |row| {
+            row.get::<_, i64>(0)
+        })? as usize,
+        links: transaction
+            .query_row("SELECT count(*) FROM links", [], |row| row.get::<_, i64>(0))?
+            as usize,
     })
 }
 
@@ -1109,6 +1205,7 @@ fn resolve_links(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
             links.push(row?);
         }
     }
+    let mut update = transaction.prepare("UPDATE links SET target_note_id = ?1 WHERE id = ?2")?;
     for (link_id, target, source_path) in links {
         let mut target_forms = vec![collapse_path(&target)];
         let source_parent = source_path.rsplit_once('/').map(|(parent, _)| parent);
@@ -1126,10 +1223,7 @@ fn resolve_links(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
             .find_map(|form| by_path.get(form).filter(|ids| ids.len() == 1));
         let candidates = exact.or_else(|| by_title.get(filename).filter(|ids| ids.len() == 1));
         if let Some(candidates) = candidates {
-            transaction.execute(
-                "UPDATE links SET target_note_id = ?1 WHERE id = ?2",
-                params![candidates[0], link_id],
-            )?;
+            update.execute(params![candidates[0], link_id])?;
         }
     }
     Ok(())

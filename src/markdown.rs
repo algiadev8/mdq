@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result};
@@ -13,9 +14,19 @@ use crate::model::{ParsedChunk, ParsedLink, ParsedNote};
 
 pub fn parse_note(vault: &Path, path: &Path) -> Result<ParsedNote> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let text = std::str::from_utf8(&bytes)
+    let hash = hex::encode(Sha256::digest(&bytes));
+    parse_note_bytes(vault, path, &bytes, hash)
+}
+
+/// Parse already-read bytes so incremental indexing does not read or hash them twice.
+pub(crate) fn parse_note_bytes(
+    vault: &Path,
+    path: &Path,
+    bytes: &[u8],
+    hash: String,
+) -> Result<ParsedNote> {
+    let text = std::str::from_utf8(bytes)
         .with_context(|| format!("{} is not valid UTF-8", path.display()))?
-        .to_owned()
         .replace("\r\n", "\n");
     let metadata = fs::metadata(path)?;
     let mtime = metadata
@@ -30,7 +41,6 @@ pub fn parse_note(vault: &Path, path: &Path) -> Result<ParsedNote> {
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(mtime);
-    let hash = hex::encode(Sha256::digest(&bytes));
     let relative = path
         .strip_prefix(vault)
         .unwrap_or(path)
@@ -84,7 +94,9 @@ fn split_frontmatter(text: &str) -> (Option<serde_json::Value>, &str, usize) {
 }
 
 fn split_chunks(body: &str) -> Vec<ParsedChunk> {
-    let heading_re = Regex::new(r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*$").unwrap();
+    static HEADING_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*$").unwrap());
+    let heading_re = &*HEADING_RE;
     let mut sections = Vec::new();
     let mut last = 0;
     let mut heading = None;
@@ -119,19 +131,24 @@ fn push_section(chunks: &mut Vec<ParsedChunk>, heading: Option<String>, text: &s
     }
 
     let mut current = String::new();
+    let mut current_chars = 0;
     for paragraph in text.split("\n\n") {
-        if !current.is_empty() && current.chars().count() + paragraph.chars().count() > MAX_CHARS {
+        let paragraph_chars = paragraph.chars().count();
+        if !current.is_empty() && current_chars + paragraph_chars > MAX_CHARS {
             chunks.push(ParsedChunk {
                 ordinal: 0,
                 heading: heading.clone(),
                 body: current.trim().to_owned(),
             });
             current.clear();
+            current_chars = 0;
         }
         if !current.is_empty() {
             current.push_str("\n\n");
+            current_chars += 2;
         }
         current.push_str(paragraph);
+        current_chars += paragraph_chars;
     }
     if !current.trim().is_empty() {
         chunks.push(ParsedChunk {
@@ -146,28 +163,49 @@ pub fn extract_links(body: &str) -> Vec<ParsedLink> {
     // pulldown-cmark deliberately exposes code as text-like events. Mask those byte
     // ranges before applying the Wiki-link regexp so links shown as examples never
     // become graph edges. Newlines are retained to keep the Markdown structure stable.
-    let mut masked = body.as_bytes().to_vec();
+    let mut masked = body.contains("[[").then(|| body.as_bytes().to_vec());
+    let mut markdown_links = Vec::new();
     let mut in_code_block = false;
     for (event, range) in Parser::new_ext(body, Options::all()).into_offset_iter() {
         match event {
             Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
             Event::End(TagEnd::CodeBlock) => {
-                mask_bytes(&mut masked, range);
+                if let Some(masked) = &mut masked {
+                    mask_bytes(masked, range);
+                }
                 in_code_block = false;
                 continue;
             }
             Event::Code(_) | Event::InlineMath(_) | Event::DisplayMath(_) => {
-                mask_bytes(&mut masked, range);
+                if let Some(masked) = &mut masked {
+                    mask_bytes(masked, range);
+                }
                 continue;
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                if let Some(link) = markdown_link(&dest_url, false) {
+                    markdown_links.push(link);
+                }
+            }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                if let Some(link) = markdown_link(&dest_url, true) {
+                    markdown_links.push(link);
+                }
             }
             _ => {}
         }
         if in_code_block {
-            mask_bytes(&mut masked, range);
+            if let Some(masked) = &mut masked {
+                mask_bytes(masked, range);
+            }
         }
     }
-    let wiki_source = String::from_utf8(masked).expect("masking produces valid UTF-8");
-    let wiki_re = Regex::new(r"(!)?\[\[([^\[\]]+)\]\]").unwrap();
+    let wiki_source = masked
+        .map(|masked| String::from_utf8(masked).expect("masking produces valid UTF-8"))
+        .unwrap_or_default();
+    static WIKI_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(!)?\[\[([^\[\]]+)\]\]").unwrap());
+    let wiki_re = &*WIKI_RE;
     let mut links: Vec<ParsedLink> = wiki_re
         .captures_iter(&wiki_source)
         .filter_map(|captures| {
@@ -189,34 +227,32 @@ pub fn extract_links(body: &str) -> Vec<ParsedLink> {
         })
         .collect();
 
-    links.extend(Parser::new_ext(body, Options::all()).filter_map(|event| {
-        let (destination, is_embed) = match event {
-            Event::Start(Tag::Link { dest_url, .. }) => (dest_url, false),
-            Event::Start(Tag::Image { dest_url, .. }) => (dest_url, true),
-            _ => return None,
-        };
-        let raw = destination.trim().to_owned();
-        if is_external_destination(&raw) {
-            return None;
-        }
-        let decoded = percent_decode_str(&raw).decode_utf8_lossy().into_owned();
-        let (target, heading) = decoded
-            .split_once('#')
-            .map(|(target, heading)| (target.trim(), Some(heading.trim().to_owned())))
-            .unwrap_or((decoded.as_str(), None));
-        if target.is_empty() {
-            return None;
-        }
-        Some(ParsedLink {
-            raw_target: raw,
-            target: normalize_target(target),
-            heading,
-            is_embed,
-        })
-    }));
+    // Preserve the original Wiki-first order, including which duplicate wins.
+    links.extend(markdown_links);
     let mut seen = HashSet::new();
     links.retain(|link| seen.insert((link.target.clone(), link.heading.clone(), link.is_embed)));
     links
+}
+
+fn markdown_link(destination: &str, is_embed: bool) -> Option<ParsedLink> {
+    let raw = destination.trim().to_owned();
+    if is_external_destination(&raw) {
+        return None;
+    }
+    let decoded = percent_decode_str(&raw).decode_utf8_lossy().into_owned();
+    let (target, heading) = decoded
+        .split_once('#')
+        .map(|(target, heading)| (target.trim(), Some(heading.trim().to_owned())))
+        .unwrap_or((decoded.as_str(), None));
+    if target.is_empty() {
+        return None;
+    }
+    Some(ParsedLink {
+        raw_target: raw,
+        target: normalize_target(target),
+        heading,
+        is_embed,
+    })
 }
 
 fn mask_bytes(bytes: &mut [u8], range: std::ops::Range<usize>) {
@@ -228,7 +264,9 @@ fn mask_bytes(bytes: &mut [u8], range: std::ops::Range<usize>) {
 }
 
 pub fn extract_tags(body: &str) -> Vec<String> {
-    let tag_re = Regex::new(r"(?:^|[^A-Za-z0-9_])#([A-Za-z0-9_/-]+)").unwrap();
+    static TAG_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?:^|[^A-Za-z0-9_])#([A-Za-z0-9_/-]+)").unwrap());
+    let tag_re = &*TAG_RE;
     let mut tags: Vec<String> = tag_re
         .captures_iter(body)
         .filter_map(|captures| {
@@ -298,6 +336,38 @@ mod tests {
         let links = extract_links(body);
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].target, "target");
+    }
+
+    #[test]
+    fn fused_link_scan_preserves_wiki_first_deduplication_and_math_masking() {
+        let links = extract_links(
+            "[first](target.md#Part) [[target#Part|Alias]] $[[math]]$ ![asset](a.png) ![[a.png]] [[最後]]",
+        );
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.raw_target.as_str())
+                .collect::<Vec<_>>(),
+            ["target#Part|Alias", "a.png", "最後"]
+        );
+        assert_eq!(links[0].heading.as_deref(), Some("Part"));
+        assert!(links[1].is_embed);
+        let markdown_only = extract_links("[kept](target.md) `code` ![image](a.png)");
+        assert_eq!(markdown_only.len(), 2);
+        assert_eq!(markdown_only[0].target, "target");
+    }
+
+    #[test]
+    fn chunk_character_counter_preserves_threshold_and_unicode_boundaries() {
+        let first = "日".repeat(1200);
+        let second = "本".repeat(1200);
+        // As before, the separator is not counted until after the threshold check.
+        let body = format!("{first}\n\n{second}\n\nx");
+        let chunks = split_chunks(&body);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].body, format!("{first}\n\n{second}"));
+        assert_eq!(chunks[1].body, "x");
+        assert_eq!(chunks[1].ordinal, 1);
     }
 
     #[test]

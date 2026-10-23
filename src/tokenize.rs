@@ -43,7 +43,54 @@ pub fn search_tokens(text: &str) -> Vec<String> {
 }
 
 pub fn index_text(text: &str) -> String {
-    search_tokens(text).join(" ")
+    // Write directly into one buffer instead of allocating a String per token.
+    // Keep duplicates and the exact same token boundaries as search_tokens().
+    let mut output = String::with_capacity(text.len());
+    let mut in_word = false;
+    let mut previous_cjk = None;
+    let mut paired = false;
+    for character in text.chars() {
+        if is_cjk(character) {
+            in_word = false;
+            if let Some(previous) = previous_cjk {
+                token_separator(&mut output);
+                output.push(previous);
+                output.push(character);
+                paired = true;
+            }
+            previous_cjk = Some(character);
+        } else {
+            if let Some(previous) = previous_cjk.take() {
+                if !paired {
+                    token_separator(&mut output);
+                    output.push(previous);
+                }
+                paired = false;
+            }
+            if character.is_alphanumeric() || character == '_' {
+                if !in_word {
+                    token_separator(&mut output);
+                    in_word = true;
+                }
+                output.extend(character.to_lowercase());
+            } else {
+                in_word = false;
+            }
+        }
+    }
+    if let Some(previous) = previous_cjk {
+        if !paired {
+            token_separator(&mut output);
+            output.push(previous);
+        }
+    }
+    output
+}
+
+fn token_separator(output: &mut String) {
+    if !output.is_empty() {
+        output.push(' ');
+    }
 }
 
 pub fn fts_query(text: &str) -> String {
@@ -68,6 +115,31 @@ fn is_cjk(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_index_matches_reference_tokenizer() {
+        let alphabet = [
+            'A', 'z', '_', '7', ' ', '\n', '"', '日', '本', 'あ', 'ア', '한', 'é', 'İ', '\u{301}',
+            '😀',
+        ];
+        // Exhaust every four-character combination, including Unicode lowercase
+        // expansion, CJK/Latin transitions, punctuation and isolated CJK characters.
+        for &a in &alphabet {
+            for &b in &alphabet {
+                for &c in &alphabet {
+                    for &d in &alphabet {
+                        let text: String = [a, b, c, d].into_iter().collect();
+                        assert_eq!(
+                            index_text(&text),
+                            search_tokens(&text).join(" "),
+                            "{text:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(index_text(""), "");
+    }
 
     #[test]
     fn tokenizes_japanese_as_bigrams() {
