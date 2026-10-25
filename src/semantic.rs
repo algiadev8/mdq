@@ -164,7 +164,12 @@ fn select_accelerator<A>(
     preference: BackendPreference,
     initialize: impl FnOnce() -> Result<A>,
 ) -> Result<Option<A>> {
-    if preference == BackendPreference::Cpu {
+    // Availability is not a speed test: CoreML initialization and shape
+    // changes cost seconds even with compiled artifacts cached. End-to-end
+    // measurements currently favor CPU for incremental jobs and queries.
+    // Keep auto conservative until an amortized acceleration policy is proven;
+    // crucially, skip even accelerator setup/model hashing on this path.
+    if preference != BackendPreference::CoreMl {
         return Ok(None);
     }
     match initialize() {
@@ -235,15 +240,23 @@ mod tests {
     }
 
     #[test]
-    fn auto_selects_available_accelerator_or_falls_back_on_initialization_error() {
-        assert_eq!(
-            select_accelerator(BackendPreference::Auto, || Ok(42)).unwrap(),
-            Some(42)
-        );
+    fn auto_never_initializes_coreml_for_indexing_or_queries() {
+        // A performance regression guard: availability must not trigger a
+        // potentially minute-long compilation on the default execution path.
         assert!(
-            select_accelerator::<()>(BackendPreference::Auto, || anyhow::bail!("not available"))
-                .unwrap()
-                .is_none()
+            select_accelerator::<()>(BackendPreference::Auto, || panic!(
+                "auto must avoid CoreML setup, hashing, compilation and shape changes"
+            ))
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn explicit_coreml_still_initializes_the_accelerator() {
+        assert_eq!(
+            select_accelerator(BackendPreference::CoreMl, || Ok(42)).unwrap(),
+            Some(42)
         );
     }
 

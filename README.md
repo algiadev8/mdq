@@ -116,17 +116,20 @@ reducing padding work without changing the model, passage/query prefixes,
 Automatic embedding refreshes use the same default. Completed batches are saved
 immediately, so interrupted indexing resumes from the embedding cache.
 
-On Apple Silicon macOS, the default `MDQ_EMBED_BACKEND=auto` tries **CoreML**
-(MLProgram, with GPU/Neural Engine selection managed by Apple). It specializes
-fixed batch/token shapes to avoid the dynamic-dimension fallback of the original
-ONNX model. Other platforms keep the CPU path. Initialization or inference
-failure retries the same batch on CPU and disables CoreML for that operation.
-Each new shape is checked against CPU embeddings before its results are cached.
-The compiled CoreML cache is separated by model SHA-256, runtime/settings, and
-shape. First use compiles device-specific models and can take tens of seconds
-per shape; even cached session startup can make small one-off jobs slower than
-CPU. This path is primarily useful for sustained indexing, not a promise that
-every invocation is faster.
+The default `MDQ_EMBED_BACKEND=auto` currently selects **CPU**, including on
+Apple Silicon. CoreML's faster steady-state inference does not compensate for
+its expensive initialization and shape changes in measured incremental jobs.
+Auto therefore skips CoreML setup, model hashing, compilation, and compatibility
+checks entirely, for both indexing and query embeddings. There is no unmeasured
+document-count threshold that automatically enables CoreML.
+
+The experimental **CoreML** backend remains available explicitly on Apple
+Silicon macOS (MLProgram, GPU/Neural Engine selection managed by Apple). It uses
+fixed batch/token shapes and checks each new shape against CPU embeddings.
+Its compiled cache is separated by model SHA-256, runtime/settings, and shape.
+Each shape change recreates the session; even cached initialization can take
+seconds. Use it only for diagnostics and deliberate benchmarking, not as the
+recommended indexing path.
 
 Use `MDQ_EMBED_BACKEND=cpu` to force the original CPU path, or
 `MDQ_EMBED_BACKEND=coreml` for strict diagnostics (errors instead of silent CPU
